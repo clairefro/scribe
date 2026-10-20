@@ -1,25 +1,40 @@
 # scribe
 
-Local audio transcription CLI using [faster-whisper](https://github.com/SYSTRAN/faster-whisper), with optional speaker diarization (pyannote segmentation + NeMo TitaNet via sherpa-onnx). Runs fully offline once models are downloaded.
+Local audio transcription CLI using [faster-whisper](https://github.com/SYSTRAN/faster-whisper), with optional speaker diarization (pyannote segmentation + WeSpeaker embeddings via sherpa-onnx). Runs fully offline once models are downloaded.
 
 ## Usage
 
 ```
 scribe talk.m4a -o talk.txt
 scribe meeting.wav -o meeting.txt --diarize --num-speakers 3 --timestamps
+scribe interview.m4a -o interview.md --diarize   # 2 speakers by default; .md gives markdown
 ```
 
-| Option           | Description                                         |
-| ---------------- | --------------------------------------------------- |
-| `-o, --output`   | Output transcript path (default: stdout)            |
-| `-m, --model`    | Whisper model name or local path (default: `small`) |
-| `-l, --language` | Language code, e.g. `en` (default: auto-detect)     |
-| `--device`       | `auto`, `cpu`, or `cuda`                            |
-| `--compute-type` | e.g. `int8`, `float16`                              |
-| `--threads`      | CPU threads (default: 4)                            |
-| `-d, --diarize`  | Label speakers                                      |
-| `--num-speakers` | Known speaker count (improves diarization)          |
-| `--timestamps`   | Prefix lines with timestamps                        |
+| Option                                     | Description                                                                                 |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------- |
+| `-o, --output`                             | Output path; `.md`/`.markdown` gives markdown (default: stdout)                             |
+| `-m, --model`                              | Whisper model name or local path (default: `small`)                                         |
+| `-l, --language`                           | Language code, e.g. `en` (default: auto-detect)                                             |
+| `--device`                                 | `auto`, `cpu`, or `cuda`                                                                    |
+| `--compute-type`                           | e.g. `int8`, `float16`                                                                      |
+| `--threads`                                | CPU threads (default: 4)                                                                    |
+| `-d, --diarize`                            | Label speakers (assumes 2 speakers unless `--num-speakers` is set)                          |
+| `--num-speakers`                           | Speaker count for `--diarize` (default: 2; `0` auto-detects)                                |
+| `--embedding-model`                        | `wespeaker-resnet34` (default), `campplus-en`, `titanet-small`, `titanet-large`             |
+| `--cluster-threshold`                      | With `--num-speakers 0`: lower finds more speakers (default: 0.5)                           |
+| `--min-turn`                               | Merge speaker turns shorter than N seconds into the neighbouring speaker (default: 0 = off) |
+| `--min-duration-on` / `--min-duration-off` | Diarizer segment filtering/merging in seconds (defaults: 0.3 / 0.5)                         |
+| `--word-shift`                             | Shift word times later (seconds) when matching speaker turns; fixes first words going to the previous speaker (default: 0.15) |
+| `--timestamps`                             | Prefix lines with timestamps                                                                |
+
+### Diarization tips
+
+- Defaults are tuned for two-person calls. For other counts pass `--num-speakers N`, or `0` to auto-detect.
+- Clean audio matters most: headsets or separate mics, no speakerphone, little crosstalk. Separate per-participant recordings beat any diarization model.
+- Speakers flip back and forth: enable smoothing with `--min-turn 1` (up to 3-4 for heavier smoothing) or raise `--min-duration-off` (1.0).
+- Smoothing is off by default; if it drops real short replies, lower `--min-turn`.
+- Try `--embedding-model campplus-en` or `titanet-large` and compare on the same file.
+- Each model downloads on first use; the built binary bundles only the default.
 
 Supported input: any audio format FFmpeg can decode, including m4a, mp3, wav, ogg, flac, aac, opus, wma and webm (video files such as mp4 work too; only the audio track is used). The extension doesn't matter, only the actual encoding.
 

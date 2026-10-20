@@ -48,7 +48,7 @@ def fetch_diarization_models(embedding=DEFAULT_EMBEDDING):
     return CACHE / filename
 
 
-def diarize(samples, num_speakers, threads, embedding=DEFAULT_EMBEDDING, threshold=0.5):
+def diarize(samples, num_speakers, threads, embedding=DEFAULT_EMBEDDING, threshold=0.5, min_on=0.3, min_off=0.5):
     import sherpa_onnx
 
     emb_path = fetch_diarization_models(embedding)
@@ -65,8 +65,8 @@ def diarize(samples, num_speakers, threads, embedding=DEFAULT_EMBEDDING, thresho
         clustering=sherpa_onnx.FastClusteringConfig(
             num_clusters=num_speakers or -1, threshold=threshold
         ),
-        min_duration_on=0.3,
-        min_duration_off=0.5,
+        min_duration_on=min_on,
+        min_duration_off=min_off,
     )
     sd = sherpa_onnx.OfflineSpeakerDiarization(config)
 
@@ -79,16 +79,19 @@ def diarize(samples, num_speakers, threads, embedding=DEFAULT_EMBEDDING, thresho
         result = sd.process(samples, callback=on_progress).sort_by_start_time()
     turns = [(r.start, r.end, r.speaker) for r in result]
     log(f"diarization: {len(turns)} turns, {len({t[2] for t in turns})} speakers")
+    if not num_speakers and len({t[2] for t in turns}) < 2:
+        log(f"hint: one speaker found; pass --num-speakers N or lower --cluster-threshold (now {threshold})")
     return turns
 
 
-def speaker_for(seg, turns):
-    best, best_overlap = None, 0.0
-    for start, end, spk in turns:
-        overlap = min(seg.end, end) - max(seg.start, start)
-        if overlap > best_overlap:
-            best, best_overlap = spk, overlap
-    return best
+def speaker_for(word, turns, shift=0.0):
+    """Speaker whose turn contains the word's midpoint (shifted later by `shift` s), else the nearest turn within 0.5 s."""
+    t = (word.start + word.end) / 2 + shift
+    inside = [x for x in turns if x[0] <= t <= x[1]]
+    if inside:
+        return max(inside, key=lambda x: min(word.end, x[1]) - max(word.start, x[0]))[2]
+    gap, spk = min(((max(s - t, t - e), spk) for s, e, spk in turns), default=(None, None))
+    return spk if gap is not None and gap <= 0.5 else None
 
 
 def coalesce(blocks):
@@ -106,7 +109,9 @@ def smooth(blocks, min_turn):
     """Relabel turns shorter than min_turn seconds to the longer adjacent speaker."""
     blocks = coalesce(blocks)
     while len(blocks) > 1:
-        short = [i for i, b in enumerate(blocks) if b["end"] - b["start"] < min_turn]
+        # Never absorb a speaker's only turns, or a speaker with short turns vanishes.
+        keep = {b["label"] for b in blocks if b["end"] - b["start"] >= min_turn}
+        short = [i for i, b in enumerate(blocks) if b["end"] - b["start"] < min_turn and b["label"] in keep]
         if not short:
             break
         i = min(short, key=lambda i: blocks[i]["end"] - blocks[i]["start"])
@@ -164,8 +169,8 @@ def main():
         description="Local audio transcription.",
         epilog="examples:\n"
         "  scribe talk.m4a -o talk.txt\n"
-        "  scribe meeting.wav -o meeting.txt --diarize --num-speakers 2\n"
-        "  scribe meeting.wav -o meeting.md --diarize --num-speakers 2",
+        "  scribe meeting.wav -o meeting.txt --diarize\n"
+        "  scribe meeting.wav -o meeting.md --diarize --num-speakers 3",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("audio", type=Path, help="input audio file (m4a, wav, mp3, ogg, ...)")
@@ -175,11 +180,14 @@ def main():
     p.add_argument("--device", default="auto", help="auto, cpu, or cuda")
     p.add_argument("--compute-type", default="auto", help="e.g. int8, float16")
     p.add_argument("--threads", type=int, default=4)
-    p.add_argument("-d", "--diarize", action="store_true", help="label speakers")
-    p.add_argument("--num-speakers", type=int, help="known speaker count (improves diarization)")
+    p.add_argument("-d", "--diarize", action="store_true", help="label speakers (assumes 2 speakers unless --num-speakers is set)")
+    p.add_argument("--num-speakers", type=int, default=2, help="speaker count for diarization; 0 auto-detects via --cluster-threshold (default: 2)")
     p.add_argument("--embedding-model", choices=list(EMBEDDING_MODELS), default=DEFAULT_EMBEDDING, help="speaker embedding model (default: %(default)s)")
-    p.add_argument("--cluster-threshold", type=float, default=0.5, help="used when --num-speakers is unset; lower finds more speakers (default: 0.5)")
-    p.add_argument("--min-turn", type=float, default=2.0, help="merge speaker turns shorter than this many seconds into the neighbouring speaker; 0 disables (default: 2.0)")
+    p.add_argument("--cluster-threshold", type=float, default=0.5, help="used when --num-speakers is 0; lower finds more speakers (default: 0.5)")
+    p.add_argument("--min-turn", type=float, default=0.0, help="merge speaker turns shorter than this many seconds into the neighbouring speaker; 0 disables (default: 0)")
+    p.add_argument("--min-duration-on", type=float, default=0.3, help="drop diarizer speech segments shorter than this many seconds (default: 0.3)")
+    p.add_argument("--min-duration-off", type=float, default=0.5, help="merge same-speaker segments separated by less than this many seconds (default: 0.5)")
+    p.add_argument("--word-shift", type=float, default=0.15, help="seconds to shift word times later when matching speaker turns; fixes first words of a turn going to the previous speaker (default: 0.15)")
     p.add_argument("--timestamps", action="store_true", help="prefix lines with timestamps")
     args = p.parse_args()
     markdown = bool(args.output) and args.output.suffix.lower() in (".md", ".markdown")
@@ -214,7 +222,7 @@ def main():
 
     turns = []
     if args.diarize:
-        turns = diarize(samples, args.num_speakers, args.threads, args.embedding_model, args.cluster_threshold)
+        turns = diarize(samples, args.num_speakers, args.threads, args.embedding_model, args.cluster_threshold, args.min_duration_on, args.min_duration_off)
 
     blocks = []  # (label, start, text)
     if args.diarize:
@@ -222,7 +230,7 @@ def main():
         prev_label = None
         for seg in segments:
             for w in seg.words or []:
-                spk = speaker_for(w, turns)
+                spk = speaker_for(w, turns, args.word_shift)
                 label = f"SPEAKER_{spk:02d}" if spk is not None else (prev_label or "UNKNOWN")
                 prev_label = label
                 if blocks and blocks[-1]["label"] == label:
