@@ -1,0 +1,23 @@
+[project]
+name = "scribe"
+version = "0.1.0"
+description = "Local audio transcription CLI with optional diarization"
+requires-python = ">=3.10"
+dependencies = [
+    "faster-whisper>=1.0.3",
+    "av>=13,<16",
+    "sherpa-onnx>=1.10.30",
+]
+
+[project.optional-dependencies]
+build = ["pyinstaller"]
+
+[project.scripts]
+scribe = "scribe.cli:main"
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["scribe"]
