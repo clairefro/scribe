@@ -2,10 +2,9 @@
 name = "scribe"
 version = "0.1.0"
 description = "Local audio transcription CLI with optional diarization"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.15"
 dependencies = [
     "faster-whisper>=1.0.3",
-    "av>=13,<16",
     "sherpa-onnx>=1.10.30",
 ]
 

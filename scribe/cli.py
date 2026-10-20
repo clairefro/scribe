@@ -22,6 +22,23 @@ EMBEDDING_MODELS = {
 DEFAULT_EMBEDDING = "wespeaker-resnet34"
 PARAGRAPH_GAP = 2.0  # seconds of silence that starts a new paragraph
 PARAGRAPH_CHARS = 500  # paragraphs break at the next sentence end once this long
+
+# Only terms Whisper tends to mishear; common words (Python, Rust, Linux, ...) are left out because they bias output.
+# Hotword budget is ~223 tokens; terms that don't fit are dropped, and user terms take priority.
+DEFAULT_TERMS = [
+    # Recurse Center
+    "Recurse Center", "RC",
+    # Languages
+    "C++", "C#", "Zig", "OCaml", "Clojure", "Haskell", "Elixir", "Golang",
+    # Frameworks and libraries
+    "Next.js", "Node.js", "FastAPI", "PyTorch",
+    # Data and infrastructure
+    "PostgreSQL", "SQLite", "Kubernetes", "Terraform", "GCP", "macOS",
+    # APIs and formats
+    "gRPC", "GraphQL", "WebAssembly", "WASM", "OAuth", "JWT", "YAML", "CI/CD",
+    # Tools and practices
+    "GitLab", "VS Code", "Vim", "regex", "LeetCode",
+]
 SEG_PATH = CACHE / "sherpa-onnx-pyannote-segmentation-3-0" / "model.onnx"
 
 
@@ -121,6 +138,22 @@ def smooth(blocks, min_turn):
     return blocks
 
 
+def load_audio(path):
+    """Decode any audio file to 16 kHz mono float32; faster-whisper's own decoder breaks on newer PyAV."""
+    import av
+    import numpy as np
+
+    resampler = av.audio.resampler.AudioResampler(format="s16", layout="mono", rate=16000)
+    chunks = []
+    with av.open(str(path), mode="r") as container:
+        for frame in container.decode(audio=0):
+            chunks += [f.to_ndarray().reshape(-1) for f in resampler.resample(frame)]
+    chunks += [f.to_ndarray().reshape(-1) for f in resampler.resample(None)]
+    if not chunks:
+        raise SystemExit(f"no audio found in {path}")
+    return np.concatenate(chunks).astype(np.float32) / 32768.0
+
+
 def ts(t):
     h, rem = divmod(int(t), 3600)
     m, s = divmod(rem, 60)
@@ -188,6 +221,9 @@ def main():
     p.add_argument("--min-duration-on", type=float, default=0.3, help="drop diarizer speech segments shorter than this many seconds (default: 0.3)")
     p.add_argument("--min-duration-off", type=float, default=0.5, help="merge same-speaker segments separated by less than this many seconds (default: 0.5)")
     p.add_argument("--word-shift", type=float, default=0.15, help="seconds to shift word times later when matching speaker turns; fixes first words of a turn going to the previous speaker (default: 0.15)")
+    p.add_argument("--terms", help='comma-separated vocabulary to favour, e.g. "GSoC, Kubernetes, PostgreSQL"')
+    p.add_argument("--terms-file", type=Path, help="file with one term per line (or comma-separated) to favour")
+    p.add_argument("--no-default-terms", action="store_true", help="don't use the built-in programming vocabulary")
     p.add_argument("--timestamps", action="store_true", help="prefix lines with timestamps")
     args = p.parse_args()
     markdown = bool(args.output) and args.output.suffix.lower() in (".md", ".markdown")
@@ -195,10 +231,10 @@ def main():
     if not args.audio.is_file():
         p.error(f"file not found: {args.audio}")
 
-    from faster_whisper import WhisperModel, decode_audio
+    from faster_whisper import WhisperModel
 
     log("decoding audio")
-    samples = decode_audio(str(args.audio), sampling_rate=16000)
+    samples = load_audio(args.audio)
 
     bundled = BUNDLE / "bundled_models" / args.model
     model_id = str(bundled) if bundled.is_dir() else args.model
@@ -209,8 +245,26 @@ def main():
         compute_type=args.compute_type,
         cpu_threads=args.threads,
     )
+    user_terms = [t.strip() for t in (args.terms or "").split(",")]
+    if args.terms_file:
+        user_terms += [t.strip() for t in args.terms_file.read_text(encoding="utf-8").replace("\n", ",").split(",")]
+    # Hotwords are cut at the token limit from the end, so put user terms first and drop terms that don't fit.
+    ordered = list(dict.fromkeys([t for t in user_terms if t] + ([] if args.no_default_terms else DEFAULT_TERMS)))
+    budget = model.max_length // 2 - 1
+    chosen = []
+    for term in ordered:
+        candidate = " " + ", ".join(chosen + [term])
+        if len(model.hf_tokenizer.encode(candidate, add_special_tokens=False).ids) <= budget:
+            chosen.append(term)
+    if len(chosen) < len(ordered):
+        log(f"glossary: using {len(chosen)} of {len(ordered)} terms (Whisper token limit)")
+    terms = ", ".join(chosen)
     segments, info = model.transcribe(
-        samples, language=args.language, vad_filter=True, word_timestamps=args.diarize
+        samples,
+        language=args.language,
+        vad_filter=True,
+        word_timestamps=args.diarize,
+        hotwords=terms or None,
     )
     log(f"language: {info.language}")
     collected = []
